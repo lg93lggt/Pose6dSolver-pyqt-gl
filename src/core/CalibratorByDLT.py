@@ -2,14 +2,15 @@
 
 import argparse
 import os
+import sys
 from typing import Tuple
 
 import cv2
 import numpy as np
 
-from . import geometry as geo
-from . import FileIO 
-from .  Visualizer import Visualizer
+sys.path.append("..")
+from core import geometry as geo
+from core import FileIO 
 
 
 class CalibratorByDLT(object):
@@ -69,17 +70,43 @@ class CalibratorByDLT(object):
         return
     
     def solve(self):
-        M = self.solve_perspective_mat_3d_to_2d(self.points3d_real, self.points2d_obj)
+        L_ = self.solve_perspective_mat_3d_to_2d(self.points3d_real, self.points2d_obj, "ols")
+        lamda = 1/np.linalg.norm(L_[2, :3])
+        #L_ = L / lamda
+        cx = lamda**2 * L_[0, :3].T @ L_[2, :3]
+        cy = lamda**2 * L_[1, :3].T @ L_[2, :3]
+        fx = lamda**2 * np.linalg.norm(np.cross(L_[0, :3], L_[2, :3]))
+        fy = lamda**2 * np.linalg.norm(np.cross(L_[1, :3], L_[2, :3]))
 
-        [mat_intrin, mat_extrin] = self.decomposition_intrin_extrin_from_projection_mat(M)
- 
+        tx = lamda * (L_[0, 3] - cx) / fx
+        ty = lamda * (L_[1, 3] - cy) / fy
+        tz = lamda 
+
+        r1 = lamda * (L_[0, :3] - cx * L_[2, :3]) / fx
+        r2 = lamda * (L_[1, :3] - cy * L_[2, :3]) / fy
+        r3 = np.cross(r1, r2)
+        
+        K = np.array([
+            [fx,  0, cx, 0], 
+            [ 0, fy, cy, 0],
+            [ 0,  0,  1, 0],
+            [ 0,  0,  0, 1]
+        ])
+        R = np.hstack([r1, r2, r3]).reshape((3, 3))
+        RT = np.eye(4)
+        RT[:3, :3] = R
+        RT[:3,  3] = np.array([tx, ty, tz])
+
+        [mat_intrin, mat_extrin] = self.decomposition_intrin_extrin_from_projection_mat(L)
+        print( RT / RT[-1, -1])
+        print(mat_extrin)
         rvec = self.R2r(mat_extrin)
         tvec = self.T2t(mat_extrin)
         self.camera_pars = {}
         self.camera_pars["intrin"] = mat_intrin
         self.camera_pars["extrin"] = mat_extrin
-        self.camera_pars["rvec"] = rvec
-        self.camera_pars["tvec"] = tvec
+        self.camera_pars["rvec"]   = rvec
+        self.camera_pars["tvec"]   = tvec
         return
 
     def outprint(self):
@@ -97,47 +124,17 @@ class CalibratorByDLT(object):
         self.outprint()
         return
 
-def main(args_cmd, **k_args):
-    mode = "calib"
-
-    vis = Visualizer()
-
-    n_points = args_cmd[0]
-    unit_length = args_cmd[1]
+if __name__ == "__main__":
+    
     fio = FileIO.FileIO()
-    fio  = k_args["fio"]
-
-    n_cams   = fio.file_structure[mode]["n_cams"]
-    n_senses = fio.file_structure[mode]["n_senses"]
-    dir_points2d  = fio.file_structure[mode]["dirs"]["points2d"]
-    dir_images    = fio.file_structure[mode]["dirs"]["images"]
-    dir_results   = fio.file_structure[mode]["dirs"]["results"]
-    dir_visualize = fio.file_structure[mode]["dirs"]["visualize"]
-    names_subdir = fio.file_structure[mode]["names_subdir"]
-    suffix_image = fio.file_structure[mode]["suffix_image"]
-    for i_sense in range(n_senses):
-        print("sense:\t{} / {}".format(i_sense + 1, n_senses))
-        pair = fio.file_structure[mode]["pairs"][i_sense]
-
-        for i_cam in range(n_cams):
-            dir_points2d = fio.file_structure[mode]["dirs"]["points2d"]
-            pth_points2d = os.path.join(dir_points2d, names_subdir[i_cam], pair[i_cam] + ".txt")
-
-            calibrator = CalibratorByDLT(n_points, unit_length)
-            points2d = fio.load_points2d(pth_points2d)
-            calibrator.set_points2d(points2d)
-            calibrator.run()
-            dir_camera_par_output = os.path.join(dir_results, names_subdir[i_cam])
-            fio.save_camera_pars(dir_camera_par_output, calibrator.camera_pars)
-
-            pth_image = os.path.join(dir_images, names_subdir[i_cam], pair[i_cam] + suffix_image)
-            img = cv2.imread(pth_image)
-            vis.draw(img=img, mode="calib", points2d=points2d, points3d=calibrator.points3d_real, camera_pars=calibrator.camera_pars)
-            cv2.imshow("cam_{}".format(i_cam + 1), img)
-            cv2.waitKey(100)
-
-            dir_image_output = os.path.join(dir_visualize, names_subdir[i_cam])
-            fio.save_image(dir_image=dir_image_output, prefix=FileIO.split_path(pth_image)[1], img=img)
-    return
+    fio.load_project_from_filedir("C:/Users/Li/work/Pose6dSolver-pyqt-gl/姿态测量")
+    p2d = fio.load_points2d("calib", 0, 0, 0)
+    p3d = fio.loadz_points3d("calib", 0, 0, 0)["array"]
+    calibrator = CalibratorByDLT()
+    calibrator.set_points3d(p3d)
+    calibrator.set_points2d(p2d)
+    calibrator.run()
+    calibrator.camera_pars
+    
     
 

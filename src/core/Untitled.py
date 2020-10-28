@@ -1,315 +1,260 @@
-#!/usr/bin/env python
-
-
-#############################################################################
-##
-## Copyright (C) 2018 Riverbank Computing Limited.
-## Copyright (C) 2010 Nokia Corporation and/or its subsidiary(-ies).
-## All rights reserved.
-##
-## This file is part of the examples of PyQt.
-##
-## $QT_BEGIN_LICENSE:BSD$
-## You may use this file under the terms of the BSD license as follows:
-##
-## "Redistribution and use in source and binary forms, with or without
-## modification, are permitted provided that the following conditions are
-## met:
-##   * Redistributions of source code must retain the above copyright
-##     notice, this list of conditions and the following disclaimer.
-##   * Redistributions in binary form must reproduce the above copyright
-##     notice, this list of conditions and the following disclaimer in
-##     the documentation and/or other materials provided with the
-##     distribution.
-##   * Neither the name of Nokia Corporation and its Subsidiary(-ies) nor
-##     the names of its contributors may be used to endorse or promote
-##     products derived from this software without specific prior written
-##     permission.
-##
-## THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
-## "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
-## LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
-## A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
-## OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
-## SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
-## LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
-## DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
-## THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
-## (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-## OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
-## $QT_END_LICENSE$
-##
-#############################################################################
-
+# -*- coding: utf-8 -*-
+# ref: https://www.cnblogs.com/superxuezhazha/p/6195328.html
+# ref: https://riptutorial.com/zh-CN/pyqt5/example/29500/%E5%9F%BA%E6%9C%AC%E7%9A%84pyqt%E8%BF%9B%E5%BA%A6%E6%9D%A1
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import *
+from PyQt5.QtWidgets import *
+from PyQt5.QtGui import *
+from PyQt5.QtOpenGL import *
+from OpenGL.GL import *
 
 import sys
-import math
+import time
+import struct
+import logging
+import cv2
+import numpy as np
 
-from PyQt5.QtCore import pyqtSignal, QPoint, QSize, Qt
-from PyQt5.QtGui import QColor, QOpenGLVersionProfile
-from PyQt5.QtWidgets import (QApplication, QHBoxLayout, QOpenGLWidget, QSlider,
-        QWidget)
+VIDEO_WIDTH = 512
+VIDEO_HEIGHT = 424
+playerMutex = QMutex() # 创建线程锁
 
-
-class Window(QWidget):
+# 底部控制条，开始、暂停、进度条等
+class PlayerControl(QDialog):
+    videoPlayStarted = pyqtSignal()
+    videoPlayPaused = pyqtSignal()
+    videoPlayStoped = pyqtSignal()
     def __init__(self):
-        super(Window, self).__init__()
+        super().__init__()
+        self.init_ui()
+        self.init_event()
+        self.thread_pause = False
+        
+    def init_ui(self):
+        self.setWindowTitle('Progress Bar')
+        self.setFixedHeight(80)
+        self.progress = QProgressBar(self)
+        self.progress.setGeometry(0, 0, 500, 25)
+        self.progress.setMaximum(100)
+        self.buttonStart = QPushButton('Start', self)
+        self.buttonPause = QPushButton('Pause', self)
+        self.buttonStop = QPushButton('Stop', self)
+        self.buttonStart.move(0, 30)
+        self.buttonPause.move(90, 30)
+        self.buttonStop.move(180, 30)
+        
+    def init_event(self):
+        self.buttonStart.clicked.connect(self.onButtonStartClick)
+        self.buttonPause.clicked.connect(self.onButtonPauseClick)
+        self.buttonStop.clicked.connect(self.onButtonStopClick)
 
-        self.glWidget = GLWidget()
+    def onButtonStartClick(self):
+        if self.thread_pause:
+            playerMutex.unlock()
+            self.thread_pause = False
+        
+        self.buttonStart.setEnabled(False)
+        self.buttonPause.setEnabled(True)
+        self.buttonStop.setEnabled(True)
+        self.videoPlayStarted.emit()
+        
+    def onButtonPauseClick(self):
+        playerMutex.lock()
+        self.thread_pause = True
+        self.buttonStart.setEnabled(True)
+        self.buttonPause.setEnabled(False)
+        self.buttonStop.setEnabled(True)
+        self.videoPlayPaused.emit()
+        
+    def onButtonStopClick(self):
+        self.progress.setValue(0)
+        if self.thread_pause:
+            playerMutex.unlock()
+            self.thread_pause = False
+        
+        self.buttonStart.setEnabled(True)
+        self.buttonPause.setEnabled(False)
+        self.buttonStop.setEnabled(False)
+        self.videoPlayStoped.emit()
+        
+    def onProcessChanged(self, value):
+        self.progress.setValue(value)
 
-        self.xSlider = self.createSlider()
-        self.ySlider = self.createSlider()
-        self.zSlider = self.createSlider()
+class VideoPlayer(QThread):
+    """
+    Runs a VideoPlayer thread.
+    """
+    updateView = pyqtSignal(bytes, int, int)
+    progressChanged = pyqtSignal(int)
+    
+    def __init__(self, video_file):
+        super(VideoPlayer, self).__init__()
+        self._run = False
+        self.video_pause = True
+        self.video_Stop = True
+        self.video_file = video_file
+    
+    def get_frame_count(self):
+        # 自定义格式，在视频末尾增加了帧总数，8个字节
+        with open(self.video_file, "rb") as f:
+            f.seek(f.seek(0, 2) - 8, 0)
+            frame_count = struct.unpack('Q', f.read(8))[0]
+        logging.info("frame_count: %s" %frame_count)
+        return frame_count
+    
+    def onVideoPlayStarted(self):
+        self.video_pause = False
+        self.video_Stop = False
+        self.start()
+        
+    def onVideoPlayPaused(self):
+        self.video_pause = True
+        self.video_Stop = False
+        
+    def onVideoPlayStoped(self):
+        self.video_pause = True
+        self.video_Stop = True
+        self._run = False
+        
+    def run(self):
+        cap = cv2.VideoCapture(self.video_file)
+        if not cap:
+            return
+        frame_index = 0
+        total_frame_num = self.get_frame_count()
+        self._run = True
+        while self._run:
+            if self.video_pause:
+                playerMutex.lock()
+                self.video_pause = False
+                playerMutex.unlock()
+                continue
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            if self.video_Stop:
+                break
+            if total_frame_num and total_frame_num > 0:
+                frame_index += 1
+                progress = frame_index*100 / total_frame_num
+                self.progressChanged.emit(progress)
+            img = cv2.resize(frame, (VIDEO_WIDTH, VIDEO_HEIGHT), interpolation = cv2.INTER_AREA)
 
-        self.xSlider.valueChanged.connect(self.glWidget.setXRotation)
-        self.glWidget.xRotationChanged.connect(self.xSlider.setValue)
-        self.ySlider.valueChanged.connect(self.glWidget.setYRotation)
-        self.glWidget.yRotationChanged.connect(self.ySlider.setValue)
-        self.zSlider.valueChanged.connect(self.glWidget.setZRotation)
-        self.glWidget.zRotationChanged.connect(self.zSlider.setValue)
+            # 用绿色(0, 255, 0)来画出矩形
+            x, y, w, h = 10, 10, 200, 300
+            img = cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+  
+            # Using cv2.putText() method 
+            img = cv2.putText(img, 'OpenCV', (50, 50), cv2.FONT_HERSHEY_SIMPLEX , 1, (255, 0, 0), 2, cv2.LINE_AA)
 
-        mainLayout = QHBoxLayout()
-        mainLayout.addWidget(self.glWidget)
-        mainLayout.addWidget(self.xSlider)
-        mainLayout.addWidget(self.ySlider)
-        mainLayout.addWidget(self.zSlider)
-        self.setLayout(mainLayout)
+            # Our operations on the frame come here
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img_data = rgb.tobytes()
+            if self.video_Stop: # 防止此时已经退出
+                break
+            # Display the resulting frame
+            self.updateView.emit(img_data, rgb.shape[0], rgb.shape[1])
+        cap.release()
+            
+    def stop(self):
+        self._run = False
 
-        self.xSlider.setValue(15 * 16)
-        self.ySlider.setValue(345 * 16)
-        self.zSlider.setValue(0 * 16)
-
-        self.setWindowTitle("Hello GL")
-
-    def createSlider(self):
-        slider = QSlider(Qt.Vertical)
-
-        slider.setRange(-180 * 16, 179 * 16)
-        slider.setSingleStep(16)
-        slider.setPageStep(15 * 16)
-        slider.setTickInterval(15 * 16)
-        slider.setTickPosition(QSlider.TicksRight)
-
-        return slider
-
-
-class GLWidget(QOpenGLWidget):
-    xRotationChanged = pyqtSignal(int)
-    yRotationChanged = pyqtSignal(int)
-    zRotationChanged = pyqtSignal(int)
-
+# 播放视频的opengl窗口
+class VideoView(QGLWidget):
     def __init__(self, parent=None):
-        super(GLWidget, self).__init__(parent)
-
-        self.object = 0
-        self.xRot = 0
-        self.yRot = 0
-        self.zRot = 0
-
-        self.lastPos = QPoint()
-
-        self.trolltechGreen = QColor.fromCmykF(0.40, 0.0, 1.0, 0.0)
-        self.trolltechPurple = QColor.fromCmykF(0.39, 0.39, 0.0, 0.0)
-
-    def minimumSizeHint(self):
-        return QSize(50, 50)
-
-    def sizeHint(self):
-        return QSize(640, 480)
-
-    def setXRotation(self, angle):
-        print ("x1", angle)
-        angle = self.normalizeAngle(angle)
-        print ("x2",angle)
-        if angle != self.xRot:
-            self.xRot = angle
-            self.xRotationChanged.emit(angle)
-            self.update()
-
-    def setYRotation(self, angle):
-        angle = self.normalizeAngle(angle)
-        if angle != self.yRot:
-            self.yRot = angle
-            self.yRotationChanged.emit(angle)
-            self.update()
-
-    def setZRotation(self, angle):
-        angle = self.normalizeAngle(angle)
-        if angle != self.zRot:
-            self.zRot = angle
-            self.zRotationChanged.emit(angle)
-            self.update()
+        super(VideoView, self).__init__(parent)
+        self.width, self.height = VIDEO_WIDTH, VIDEO_HEIGHT
+        self.texture, self.data = None, None
+        if parent:
+            self.resize(parent.size())
+        
+    def update_view(self, data, height, width):
+        self.data = data
+        self.height = height
+        self.width = width
+        self.updateGL()
 
     def initializeGL(self):
-        version_profile = QOpenGLVersionProfile()
-        version_profile.setVersion(2, 0)
-        self.gl = self.context().versionFunctions(version_profile)
-        self.gl.initializeOpenGLFunctions()
+        glClearColor(0.5, 0.5, 0.5, 1.0)
 
-        self.setClearColor(self.trolltechPurple.darker())
-        self.object = self.makeObject()
-        self.axises = self.makeAxises()
-        self.gl.glShadeModel(self.gl.GL_FLAT)
-        self.gl.glEnable(self.gl.GL_DEPTH_TEST)
-        self.gl.glEnable(self.gl.GL_CULL_FACE)
+        glEnable(GL_DEPTH_TEST)
+        glClearColor(0.0, 0.0, 0.0, 0.0)
 
-    def paintGL(self):
-        self.gl.glClear(self.gl.GL_COLOR_BUFFER_BIT | self.gl.GL_DEPTH_BUFFER_BIT)
-        self.gl.glLoadIdentity()
-        self.gl.glTranslated(0.0, 0.0, -10.0)
-        self.gl.glRotated(self.xRot / 16.0, 1.0, 0.0, 0.0)
-        self.gl.glRotated(self.yRot / 16.0, 0.0, 1.0, 0.0)
-        self.gl.glRotated(self.zRot / 16.0, 0.0, 0.0, 1.0)
-        self.gl.glCallList(self.object)
-        self.gl.glLoadIdentity()
-        self.gl.glTranslated(0.0, 0.0, -10.0)
-        self.gl.glCallList(self.axises)
+        glClearDepth(2000.0)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glEnable(GL_TEXTURE_2D)
+
+        self.texture = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, self.texture)
+
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
 
 
     def resizeGL(self, width, height):
-        print ("resize")
-        side = min(width, height)
-        if side < 0:
-            return
+        glViewport(0, 0, width, height)
 
-        self.gl.glViewport((width - side) // 2, (height - side) // 2, side,
-                side)
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
 
-        self.gl.glMatrixMode(self.gl.GL_PROJECTION)
-        self.gl.glLoadIdentity()
-        #self.gl.glOrtho(-0.5, +0.5, +0.5, -0.5, 4.0, 15.0)
-        #self.gl.glMatrixMode(self.gl.GL_MODELVIEW)
+        glOrtho(0, self.width, self.height, 0.0, 0.0, 1.0)
 
-        sys.path.append("..")
-        from Camera import  Camera
-        cam = Camera()
-        import  json
-        with open("/home/veily/桌面/LiGan/Pose6dSolver-pyqt-gl/姿态测量/results_calib/cam_1/camera_pars.json") as f:
-            data = json.load(f)
-            cam.set_camera_pars(data)
-        cam.set_image_shape(480, 640)
-        M = cam.to_modelview_gl()
-        P = cam.to_projection_gl()
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
 
-        self.gl.glMatrixMode(self.gl.GL_PROJECTION)
-        self.gl.glLoadIdentity()
-        self.gl.glLoadMatrixf(P.tolist())
-        self.gl.glViewport(0, 0, cam.shape_image.width*2, cam.shape_image.height)
+
+    def paintGL(self):
+        if self.data is not None:
+            glClearColor(.5, .5, .5, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            # , width = self.data.shape[:2]
+            glTexImage2D(GL_TEXTURE_2D,
+                         0,
+                         3,
+                         self.width,
+                         self.height,
+                         0,
+                         GL_RGB,
+                         GL_UNSIGNED_BYTE,
+                         self.data)
+            glLoadIdentity()
     
-        # self.gl.glMatrixMode(self.gl.GL_MODELVIEW)
-        # self.gl.glLoadIdentity()
-     
-        #self.gl.glMultMatrixf(M.tolist())
+            glEnable(GL_TEXTURE_2D)
     
+            glBegin(GL_TRIANGLE_FAN)
+            glColor4f(255.0, 255.0, 255.0, 255.0)
+            glTexCoord2f(0, 0); glVertex3f(0, 0, 0)
+            glTexCoord2f(1, 0); glVertex3f(self.width, 0, 0)
+            glTexCoord2f(1, 1); glVertex3f(self.width, self.height, 0)
+            glTexCoord2f(0, 1); glVertex3f(0, self.height, 0)
+            glEnd()
 
-
-
-
-    def mousePressEvent(self, event):
-        self.lastPos = event.pos()
-
-    def mouseMoveEvent(self, event):
-        dx = event.x() - self.lastPos.x()
-        dy = event.y() - self.lastPos.y()
-
-        if event.buttons() & Qt.LeftButton:
-            self.setXRotation(self.xRot + 8 * dy)
-            self.setYRotation(self.yRot + 8 * dx)
-        elif event.buttons() & Qt.RightButton:
-            self.setXRotation(self.xRot + 8 * dy)
-            self.setZRotation(self.zRot + 8 * dx)
-
-        self.lastPos = event.pos()
-
-    def makeAxises(self):       
-        axisesList = self.gl.glGenLists(1)
-        self.gl.glNewList(axisesList, self.gl.GL_COMPILE)
- 
-        self.gl.glBegin(self.gl.GL_LINES)
-        self.gl.glColor4f(1., 0., 0., 1)
-        self.gl.glVertex3f(100000 / 1000, 0, 0)
-        self.gl.glVertex3f(0, 0, 0)
-
-        self.gl.glColor4f(0., 1., 0., 1)
-        self.gl.glVertex3f(0, 100000 / 1000, 0)
-        self.gl.glVertex3f(0, 0, 0)
-
-        self.gl.glColor4f(0., 0., 1., 1)
-        self.gl.glVertex3f(0, 0, 100000 / 1000)
-        self.gl.glVertex3f(0, 0, 0)
-        self.gl.glEnd()
-        self.gl.glEndList()
-        return axisesList
-
-
-    def makeObject(self):
-        genList = self.gl.glGenLists(1)
-        self.gl.glNewList(genList, self.gl.GL_COMPILE)
-
-        import sys
-        sys.path.append("..")
-        from core import FileIO
-        model = FileIO.load_model_from_stl_binary("/home/veily/桌面/LiGan/Pose6dSolver-pyqt-gl/测试/models_solve/3D_model.STL")
-
-        self.gl.glColor4f(0., 1., 0., 0.1)
-        self.gl.glBegin(self.gl.GL_POLYGON)
-        for triangle in model:
-                #self.gl.glNormal3f(triangle.normal.x, triangle.normal.y, triangle.normal.z)
-            self.gl.glVertex3f(triangle[0][0] / 1000, triangle[0][1] / 1000, triangle[0][2] / 1000)
-            self.gl.glVertex3f(triangle[1][0] / 1000, triangle[1][1] / 1000, triangle[1][2] / 1000)
-            self.gl.glVertex3f(triangle[2][0] / 1000, triangle[2][1] / 1000, triangle[2][2] / 1000)
-        self.gl.glEnd()
-        self.gl.glEndList()
-        return genList
-
-
-    def normalizeAngle(self, angle):
-        while angle < -180 * 16:
-            angle += 360 * 16
-        while angle > 180 * 16:
-            angle -= 360 * 16
-        return angle
-
-    def setClearColor(self, c):
-        self.gl.glClearColor(c.redF(), c.greenF(), c.blueF(), c.alphaF())
-
-    def setColor(self, c):
-        self.gl.glColor4f(c.redF(), c.greenF(), c.blueF(), c.alphaF())
-
-    def draw_background(self, imname):
-        """使用四边形绘制背景图像"""
+# 组合播放窗口和进度条
+class CustomVideoPlayer(QDialog):
+    def __init__(self, video_file):
+        super().__init__()
+        self.setFixedSize(900, 600)
+        self.videoView = VideoView()
+        self.playerControl = PlayerControl()
+        self.videoPlayer = VideoPlayer(video_file)
+        self.init_event()
+        self.init_ui()
         
-        #载入背景图像，转为OpenGL纹理
-        bg_image = pygame.image.load(imname).convert()
-        bg_data = pygame.image.tostring(bg_image, "RGBX", 1)
-        self.gl.glMatrixMode(self.gl.GL_MODELVIEW)
-        self.gl.glLoadIdentity()
+    def init_event(self):
+        self.playerControl.videoPlayStarted.connect(self.videoPlayer.onVideoPlayStarted)
+        self.playerControl.videoPlayPaused.connect(self.videoPlayer.onVideoPlayPaused)
+        self.playerControl.videoPlayStoped.connect(self.videoPlayer.onVideoPlayStoped)
+        self.videoPlayer.progressChanged.connect(self.playerControl.onProcessChanged)
+        self.videoPlayer.updateView.connect(self.videoView.update_view)
+    
+    def init_ui(self):
+        self.v_box = QVBoxLayout()
+        self.v_box.addWidget(self.videoView)
+        self.v_box.addWidget(self.playerControl)
+        self.setLayout(self.v_box)
 
-        self.gl.glClear(self.gl.GL_COLOR_BUFFER_BIT | self.gl.GL_DEPTH_BUFFER_BIT)
-        #绑定纹理
-        self.gl.glEnable(self.gl.GL_TEXTURE_2D)
-        self.gl.glBindTexture(self.gl.GL_TEXTURE_2D, self.gl.glGenTextures(1))
-        self.gl.glTexImage2D(self.gl.GL_TEXTURE_2D, 0, self.gl.GL_RGBA, 640, 480, 0, self.gl.GL_RGBA, self.gl.GL_UNSIGNED_BYTE, bg_data)
-        self.gl.glTexParameterf(self.gl.GL_TEXTURE_2D, self.gl.GL_TEXTURE_MAG_FILTER, self.gl.GL_NEAREST)
-        self.gl.glTexParameterf(self.gl.GL_TEXTURE_2D, self.gl.GL_TEXTURE_MIN_FILTER, self.gl.GL_NEAREST)
-        #创建四方形填充整个窗口
-        self.gl.glBegin(self.gl.GL_QUADS)
-        self.gl.glTexCoord2f(0.0, 0.0);
-        self.gl.glVertex3f(-1.0, -1.0, -1.0)
-        self.gl.glTexCoord2f(1.0, 0.0);
-        self.gl.glVertex3f(1.0, -1.0, -1.0)
-        self.gl.glTexCoord2f(1.0, 1.0);
-        self.gl.glVertex3f(1.0, 1.0, -1.0)
-        self.gl.glTexCoord2f(0.0, 1.0);
-        self.gl.glVertex3f(-1.0, 1.0, -1.0)
-        self.gl.glEnd()
-        #清除纹理
-        self.gl.glDeleteTextures(1)
-
-
-if __name__ == '__main__':
-
+if __name__ == "__main__":
     app = QApplication(sys.argv)
-    window = Window()
+    window = CustomVideoPlayer('C:/Users/Li/work/veily/_output/8de396d944ffc01adcdf4c10a9cf752a.mp4')
     window.show()
     sys.exit(app.exec_())
